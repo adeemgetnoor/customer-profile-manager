@@ -3,6 +3,7 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const FormData = require('form-data');
 require('dotenv').config();
 
 const app = express();
@@ -98,7 +99,132 @@ app.get('/health', (req, res) => {
 });
 
 // ============================================
-// ENDPOINT 2: Update Customer Profile (Metafields)
+// ENDPOINT 2: Update Customer (All Fields Including Native + Metafields)
+// ============================================
+app.post('/update-customer', async (req, res) => {
+  try {
+    const { customer_id, first_name, last_name, email, phone, alternate_phone, gender, date_of_birth } = req.body;
+
+    console.log('📝 Received full customer update request:', { 
+      customer_id, first_name, last_name, email, phone, alternate_phone, gender, date_of_birth 
+    });
+
+    if (!customer_id) {
+      return res.status(400).json({ success: false, error: 'Customer ID is required' });
+    }
+
+    // Prepare the update input
+    const updateInput = {
+      id: `gid://shopify/Customer/${customer_id}`
+    };
+
+    // Add native fields if provided
+    if (first_name) updateInput.firstName = first_name;
+    if (last_name) updateInput.lastName = last_name;
+    if (email) updateInput.email = email;
+    if (phone) updateInput.phone = phone;
+
+    // Prepare metafields array
+    const metafields = [];
+
+    if (alternate_phone !== undefined) {
+      metafields.push({
+        namespace: 'custom',
+        key: 'alternate_phone',
+        value: alternate_phone,
+        type: 'single_line_text_field'
+      });
+    }
+
+    if (gender !== undefined) {
+      metafields.push({
+        namespace: 'custom',
+        key: 'gender',
+        value: gender,
+        type: 'single_line_text_field'
+      });
+    }
+
+    if (date_of_birth !== undefined) {
+      metafields.push({
+        namespace: 'custom',
+        key: 'date_of_birth',
+        value: date_of_birth,
+        type: 'date'
+      });
+    }
+
+    // Add metafields to update input if any
+    if (metafields.length > 0) {
+      updateInput.metafields = metafields;
+    }
+
+    const mutation = `
+      mutation updateCustomer($input: CustomerInput!) {
+        customerUpdate(input: $input) {
+          customer {
+            id
+            firstName
+            lastName
+            email
+            phone
+            metafields(first: 10, namespace: "custom") {
+              edges {
+                node {
+                  key
+                  value
+                }
+              }
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `;
+
+    const variables = { input: updateInput };
+
+    console.log('🚀 Sending GraphQL mutation to Shopify...');
+    console.log('Variables:', JSON.stringify(variables, null, 2));
+
+    const response = await axios.post(
+      `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
+      { query: mutation, variables },
+      {
+        headers: {
+          'X-Shopify-Access-Token': ACCESS_TOKEN,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    console.log('✅ GraphQL response received');
+
+    const errors = response.data.data?.customerUpdate?.userErrors;
+    if (errors && errors.length > 0) {
+      console.error('❌ Shopify errors:', errors);
+      return res.status(400).json({ success: false, error: errors });
+    }
+
+    res.json({
+      success: true,
+      message: 'Customer updated successfully',
+      customer: response.data.data.customerUpdate.customer
+    });
+  } catch (err) {
+    console.error('❌ ERROR updating customer:', err.response?.data || err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: err.response?.data?.errors || err.message 
+    });
+  }
+});
+
+// ============================================
+// ENDPOINT 3: Update Customer Profile (Metafields Only - Legacy)
 // ============================================
 app.post('/update-profile', async (req, res) => {
   try {
@@ -262,7 +388,7 @@ app.get('/get-profile', async (req, res) => {
 });
 
 // ============================================
-// ENDPOINT 4: Upload Profile Image (File Type)
+// ENDPOINT 4: Upload Profile Image (Simplified)
 // ============================================
 app.post('/upload-profile-image', async (req, res) => {
   try {
@@ -276,15 +402,15 @@ app.post('/upload-profile-image', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Customer ID and image URL required' });
     }
 
-    // Step 1: Convert base64 to buffer
+    // Convert base64 to buffer
     const base64Data = image_url.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
     
     console.log('📦 Image buffer size:', buffer.length, 'bytes');
 
-    // Step 2: Create staged upload
+    // Step 1: Generate staged uploads target
     const stagedUploadMutation = `
-      mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+      mutation generateStagedUploads($input: [StagedUploadInput!]!) {
         stagedUploadsCreate(input: $input) {
           stagedTargets {
             url
@@ -303,21 +429,23 @@ app.post('/upload-profile-image', async (req, res) => {
     `;
 
     const stagedUploadVariables = {
-      input: [
-        {
-          resource: "IMAGE",
-          filename: `customer_${customer_id}_profile.jpg`,
-          mimeType: "image/jpeg",
-          httpMethod: "POST"
-        }
-      ]
+      input: [{
+        resource: "IMAGE",
+        filename: `profile_${customer_id}_${Date.now()}.jpg`,
+        mimeType: "image/jpeg",
+        httpMethod: "POST"
+      }]
     };
 
-    console.log('🚀 Step 1: Creating staged upload...');
+    console.log('🚀 Creating staged upload...');
+    console.log('Variables:', JSON.stringify(stagedUploadVariables, null, 2));
 
-    const stagedUploadResponse = await axios.post(
+    const stagedResponse = await axios.post(
       `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
-      { query: stagedUploadMutation, variables: stagedUploadVariables },
+      { 
+        query: stagedUploadMutation, 
+        variables: stagedUploadVariables 
+      },
       {
         headers: {
           'X-Shopify-Access-Token': ACCESS_TOKEN,
@@ -326,39 +454,50 @@ app.post('/upload-profile-image', async (req, res) => {
       }
     );
 
-    console.log('📥 Staged upload response:', JSON.stringify(stagedUploadResponse.data, null, 2));
+    console.log('📥 Staged response:', JSON.stringify(stagedResponse.data, null, 2));
 
-    const stagedTarget = stagedUploadResponse.data.data?.stagedUploadsCreate?.stagedTargets?.[0];
-    const stagedErrors = stagedUploadResponse.data.data?.stagedUploadsCreate?.userErrors;
-
+    // Check for errors
+    const stagedErrors = stagedResponse.data.data?.stagedUploadsCreate?.userErrors;
     if (stagedErrors && stagedErrors.length > 0) {
       console.error('❌ Staged upload errors:', stagedErrors);
-      return res.status(400).json({ success: false, error: stagedErrors });
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Failed to create staged upload',
+        details: stagedErrors
+      });
     }
 
-    if (!stagedTarget) {
-      console.error('❌ No staged target returned');
-      return res.status(400).json({ success: false, error: 'Failed to create staged upload' });
+    const stagedTarget = stagedResponse.data.data?.stagedUploadsCreate?.stagedTargets?.[0];
+    
+    if (!stagedTarget || !stagedTarget.url) {
+      console.error('❌ No staged target URL received');
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Failed to get staged upload URL',
+        response: stagedResponse.data
+      });
     }
 
-    // Step 3: Upload file to staged URL
-    console.log('🚀 Step 2: Uploading file to:', stagedTarget.url);
+    console.log('✅ Staged target URL:', stagedTarget.url);
+    console.log('✅ Resource URL:', stagedTarget.resourceUrl);
 
-    const FormData = require('form-data');
+    // Step 2: Upload file to staged URL
     const formData = new FormData();
-
-    // Add parameters from staged upload
+    
+    // Add all parameters from staged upload
     stagedTarget.parameters.forEach(param => {
       formData.append(param.name, param.value);
     });
-
-    // Add the file
+    
+    // Add the file last
     formData.append('file', buffer, {
-      filename: `customer_${customer_id}_profile.jpg`,
+      filename: `profile_${customer_id}_${Date.now()}.jpg`,
       contentType: 'image/jpeg'
     });
 
-    const uploadResponse = await axios.post(stagedTarget.url, formData, {
+    console.log('🚀 Uploading file to staged URL...');
+
+    await axios.post(stagedTarget.url, formData, {
       headers: {
         ...formData.getHeaders()
       },
@@ -367,9 +506,8 @@ app.post('/upload-profile-image', async (req, res) => {
     });
 
     console.log('✅ File uploaded successfully');
-    console.log('📍 Resource URL:', stagedTarget.resourceUrl);
 
-    // Step 4: Create file in Shopify
+    // Step 3: Create file in Shopify
     const fileCreateMutation = `
       mutation fileCreate($files: [FileCreateInput!]!) {
         fileCreate(files: $files) {
@@ -389,21 +527,20 @@ app.post('/upload-profile-image', async (req, res) => {
       }
     `;
 
-    const fileCreateVariables = {
-      files: [
-        {
-          alt: `Profile image for customer ${customer_id}`,
-          contentType: "IMAGE",
-          originalSource: stagedTarget.resourceUrl
-        }
-      ]
-    };
-
-    console.log('🚀 Step 3: Creating file in Shopify...');
+    console.log('🚀 Creating file in Shopify...');
 
     const fileCreateResponse = await axios.post(
       `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
-      { query: fileCreateMutation, variables: fileCreateVariables },
+      { 
+        query: fileCreateMutation, 
+        variables: {
+          files: [{
+            alt: `Profile image for customer ${customer_id}`,
+            contentType: "IMAGE",
+            originalSource: stagedTarget.resourceUrl
+          }]
+        }
+      },
       {
         headers: {
           'X-Shopify-Access-Token': ACCESS_TOKEN,
@@ -421,16 +558,20 @@ app.post('/upload-profile-image', async (req, res) => {
     }
 
     const fileId = fileCreateResponse.data.data?.fileCreate?.files?.[0]?.id;
+    
     if (!fileId) {
-      console.error('❌ No file ID returned');
-      return res.status(400).json({ success: false, error: 'Failed to create file' });
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Failed to create file',
+        response: fileCreateResponse.data
+      });
     }
 
     console.log('✅ File created with ID:', fileId);
 
-    // Step 5: Update customer metafield with file reference
+    // Step 4: Update customer metafield
     const updateMetafieldMutation = `
-      mutation updateCustomerImage($input: CustomerInput!) {
+      mutation updateCustomerMetafield($input: CustomerInput!) {
         customerUpdate(input: $input) {
           customer {
             id
@@ -439,13 +580,7 @@ app.post('/upload-profile-image', async (req, res) => {
                 node {
                   key
                   value
-                  reference {
-                    ... on MediaImage {
-                      image {
-                        url
-                      }
-                    }
-                  }
+                  type
                 }
               }
             }
@@ -458,25 +593,24 @@ app.post('/upload-profile-image', async (req, res) => {
       }
     `;
 
-    const updateMetafieldVariables = {
-      input: {
-        id: `gid://shopify/Customer/${customer_id}`,
-        metafields: [
-          {
-            namespace: 'custom',
-            key: 'profile_image',
-            value: fileId,
-            type: 'file_reference'
-          }
-        ]
-      }
-    };
-
-    console.log('🚀 Step 4: Updating customer metafield...');
+    console.log('🚀 Updating customer metafield with file reference...');
 
     const metafieldResponse = await axios.post(
       `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
-      { query: updateMetafieldMutation, variables: updateMetafieldVariables },
+      { 
+        query: updateMetafieldMutation, 
+        variables: {
+          input: {
+            id: `gid://shopify/Customer/${customer_id}`,
+            metafields: [{
+              namespace: 'custom',
+              key: 'profile_image',
+              value: fileId,
+              type: 'file_reference'
+            }]
+          }
+        }
+      },
       {
         headers: {
           'X-Shopify-Access-Token': ACCESS_TOKEN,
@@ -489,25 +623,25 @@ app.post('/upload-profile-image', async (req, res) => {
 
     const metafieldErrors = metafieldResponse.data.data?.customerUpdate?.userErrors;
     if (metafieldErrors && metafieldErrors.length > 0) {
-      console.error('❌ Metafield update errors:', metafieldErrors);
+      console.error('❌ Metafield errors:', metafieldErrors);
       return res.status(400).json({ success: false, error: metafieldErrors });
     }
 
-    console.log('✅ Profile image uploaded and linked successfully!');
+    console.log('✅✅✅ Profile image uploaded successfully!');
 
     res.json({ 
       success: true, 
       message: 'Profile image updated successfully',
-      fileId: fileId,
-      customer: metafieldResponse.data.data?.customerUpdate?.customer
+      fileId: fileId
     });
 
   } catch (err) {
     console.error('❌ ERROR uploading image:', err.response?.data || err.message);
-    console.error('❌ Error stack:', err.stack);
+    console.error('❌ Error details:', err);
     res.status(500).json({ 
       success: false, 
-      error: err.response?.data?.errors || err.message 
+      error: err.message,
+      details: err.response?.data
     });
   }
 });
