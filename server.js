@@ -27,7 +27,33 @@ if (!SHOP_NAME || !ACCESS_TOKEN) {
 // ============================================
 // MIDDLEWARE
 // ============================================
-app.use(cors());
+
+// Enhanced CORS for Vercel deployment
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+    
+    // Allow your Shopify store and common development origins
+    const allowedOrigins = [
+      `https://${SHOP_NAME}`,
+      `https://${SHOP_NAME.replace('.myshopify.com', '')}.myshopify.com`,
+      'http://localhost:3000',
+      'http://127.0.0.1:3000'
+    ];
+    
+    if (allowedOrigins.indexOf(origin) !== -1 || origin.endsWith('.myshopify.com')) {
+      callback(null, true);
+    } else {
+      callback(null, true); // Allow all origins for now, restrict later if needed
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -35,6 +61,27 @@ app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
   next();
+});
+
+// ============================================
+// ROOT ENDPOINT - Welcome Message
+// ============================================
+app.get('/', (req, res) => {
+  res.json({ 
+    success: true,
+    status: 'ok', 
+    message: 'Shopify Customer Profile App API',
+    version: '1.0.0',
+    timestamp: new Date().toISOString(),
+    shop: SHOP_NAME,
+    endpoints: {
+      root: '/ (GET) - This message',
+      health: '/health (GET) - Health check',
+      updateProfile: '/update-profile (POST) - Update customer metafields',
+      getProfile: '/get-profile?customer_id=xxx (GET) - Get customer profile',
+      uploadImage: '/upload-profile-image (POST) - Upload profile image'
+    }
+  });
 });
 
 // ============================================
@@ -56,6 +103,8 @@ app.get('/health', (req, res) => {
 app.post('/update-profile', async (req, res) => {
   try {
     const { customer_id, alternate_phone, gender, date_of_birth } = req.body;
+
+    console.log('📝 Received update request:', { customer_id, alternate_phone, gender, date_of_birth });
 
     if (!customer_id) {
       return res.status(400).json({ success: false, error: 'Customer ID is required' });
@@ -126,6 +175,8 @@ app.post('/update-profile', async (req, res) => {
       }
     };
 
+    console.log('🚀 Sending GraphQL mutation to Shopify...');
+
     const response = await axios.post(
       `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
       { query: mutation, variables },
@@ -137,8 +188,11 @@ app.post('/update-profile', async (req, res) => {
       }
     );
 
-    const errors = response.data.data.customerUpdate.userErrors;
+    console.log('✅ GraphQL response received');
+
+    const errors = response.data.data?.customerUpdate?.userErrors;
     if (errors && errors.length > 0) {
+      console.error('❌ Shopify errors:', errors);
       return res.status(400).json({ success: false, error: errors });
     }
 
@@ -148,8 +202,11 @@ app.post('/update-profile', async (req, res) => {
       customer: response.data.data.customerUpdate.customer
     });
   } catch (err) {
-    console.error('❌ ERROR updating profile:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    console.error('❌ ERROR updating profile:', err.response?.data || err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: err.response?.data?.errors || err.message 
+    });
   }
 });
 
@@ -280,4 +337,8 @@ app.post('/upload-profile-image', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
   console.log(`🏪 Connected to Shopify store: ${SHOP_NAME}`);
+  console.log(`✅ CORS enabled for Shopify store`);
 });
+
+// Export for Vercel
+module.exports = app;
