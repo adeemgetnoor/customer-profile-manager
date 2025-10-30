@@ -337,7 +337,7 @@ app.post('/update-profile', async (req, res) => {
 });
 
 // ============================================
-// ENDPOINT 3: Get Customer Profile
+// ENDPOINT 4: Get Customer Profile
 // ============================================
 app.get('/get-profile', async (req, res) => {
   try {
