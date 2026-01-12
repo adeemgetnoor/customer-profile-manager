@@ -80,7 +80,10 @@ app.get('/', (req, res) => {
       health: '/health (GET) - Health check',
       updateProfile: '/update-profile (POST) - Update customer metafields',
       getProfile: '/get-profile?customer_id=xxx (GET) - Get customer profile',
-      uploadImage: '/upload-profile-image (POST) - Upload profile image'
+      uploadImage: '/upload-profile-image (POST) - Upload profile image',
+      getWishlist: '/wishlist?customer_id=xxx (GET) - Get wishlist items',
+      addWishlist: '/wishlist/add (POST) - Add product to wishlist { customer_id, product_id }',
+      removeWishlist: '/wishlist/remove (POST) - Remove product from wishlist { customer_id, product_id }'
     }
   });
 });
@@ -643,6 +646,208 @@ app.post('/upload-profile-image', async (req, res) => {
       error: err.message,
       details: err.response?.data
     });
+  }
+});
+
+// ============================================
+// ENDPOINT: Wishlist - Get / Add / Remove
+// ============================================
+
+// GET wishlist - retrieve wishlist array (stored as JSON in custom.wishlist)
+app.get('/wishlist', async (req, res) => {
+  try {
+    const { customer_id } = req.query;
+    if (!customer_id) return res.status(400).json({ success: false, error: 'Customer ID is required' });
+
+    const query = `
+      query getCustomer($id: ID!) {
+        customer(id: $id) {
+          id
+          metafields(first: 10, namespace: "custom") {
+            edges {
+              node {
+                key
+                value
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const variables = { id: `gid://shopify/Customer/${customer_id}` };
+
+    const response = await axios.post(
+      `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
+      { query, variables },
+      { headers: { 'X-Shopify-Access-Token': ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+    );
+
+    const edges = response.data.data?.customer?.metafields?.edges || [];
+    const node = edges.find(e => e.node.key === 'wishlist');
+    let wishlist = [];
+    if (node && node.node.value) {
+      try { wishlist = JSON.parse(node.node.value); if (!Array.isArray(wishlist)) wishlist = []; } catch (e) { wishlist = []; }
+    }
+
+    res.json({ success: true, wishlist });
+  } catch (err) {
+    console.error('❌ ERROR fetching wishlist:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /wishlist/add - add a product to wishlist
+app.post('/wishlist/add', async (req, res) => {
+  try {
+    const { customer_id, product_id } = req.body;
+    if (!customer_id || !product_id) return res.status(400).json({ success: false, error: 'customer_id and product_id required' });
+
+    // Fetch current wishlist
+    const query = `
+      query getCustomer($id: ID!) {
+        customer(id: $id) {
+          id
+          metafields(first: 10, namespace: "custom") {
+            edges {
+              node {
+                key
+                value
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const variables = { id: `gid://shopify/Customer/${customer_id}` };
+
+    const response = await axios.post(
+      `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
+      { query, variables },
+      { headers: { 'X-Shopify-Access-Token': ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+    );
+
+    const edges = response.data.data?.customer?.metafields?.edges || [];
+    const node = edges.find(e => e.node.key === 'wishlist');
+    let wishlist = [];
+    if (node && node.node.value) {
+      try { wishlist = JSON.parse(node.node.value); if (!Array.isArray(wishlist)) wishlist = []; } catch (e) { wishlist = []; }
+    }
+
+    const pid = String(product_id);
+    if (!wishlist.includes(pid)) wishlist.push(pid);
+
+    // Update metafield
+    const mutation = `
+      mutation updateCustomerMetafields($input: CustomerInput!) {
+        customerUpdate(input: $input) {
+          customer { id metafields(first: 10, namespace: "custom") { edges { node { key value } } } }
+          userErrors { field message }
+        }
+      }
+    `;
+
+    const updateVars = {
+      input: {
+        id: `gid://shopify/Customer/${customer_id}`,
+        metafields: [{ namespace: 'custom', key: 'wishlist', value: JSON.stringify(wishlist), type: 'json' }]
+      }
+    };
+
+    const updateResponse = await axios.post(
+      `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
+      { query: mutation, variables: updateVars },
+      { headers: { 'X-Shopify-Access-Token': ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+    );
+
+    const errors = updateResponse.data.data?.customerUpdate?.userErrors;
+    if (errors && errors.length > 0) {
+      console.error('❌ Shopify errors:', errors);
+      return res.status(400).json({ success: false, error: errors });
+    }
+
+    res.json({ success: true, wishlist });
+  } catch (err) {
+    console.error('❌ ERROR adding to wishlist:', err.response?.data || err.message);
+    res.status(500).json({ success: false, error: err.response?.data || err.message });
+  }
+});
+
+// POST /wishlist/remove - remove a product from wishlist
+app.post('/wishlist/remove', async (req, res) => {
+  try {
+    const { customer_id, product_id } = req.body;
+    if (!customer_id || !product_id) return res.status(400).json({ success: false, error: 'customer_id and product_id required' });
+
+    // Fetch current wishlist
+    const query = `
+      query getCustomer($id: ID!) {
+        customer(id: $id) {
+          id
+          metafields(first: 10, namespace: "custom") {
+            edges {
+              node {
+                key
+                value
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const variables = { id: `gid://shopify/Customer/${customer_id}` };
+
+    const response = await axios.post(
+      `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
+      { query, variables },
+      { headers: { 'X-Shopify-Access-Token': ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+    );
+
+    const edges = response.data.data?.customer?.metafields?.edges || [];
+    const node = edges.find(e => e.node.key === 'wishlist');
+    let wishlist = [];
+    if (node && node.node.value) {
+      try { wishlist = JSON.parse(node.node.value); if (!Array.isArray(wishlist)) wishlist = []; } catch (e) { wishlist = []; }
+    }
+
+    const pid = String(product_id);
+    const newWishlist = wishlist.filter(p => String(p) !== pid);
+
+    // Update metafield
+    const mutation = `
+      mutation updateCustomerMetafields($input: CustomerInput!) {
+        customerUpdate(input: $input) {
+          customer { id metafields(first: 10, namespace: "custom") { edges { node { key value } } } }
+          userErrors { field message }
+        }
+      }
+    `;
+
+    const updateVars = {
+      input: {
+        id: `gid://shopify/Customer/${customer_id}`,
+        metafields: [{ namespace: 'custom', key: 'wishlist', value: JSON.stringify(newWishlist), type: 'json' }]
+      }
+    };
+
+    const updateResponse = await axios.post(
+      `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
+      { query: mutation, variables: updateVars },
+      { headers: { 'X-Shopify-Access-Token': ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+    );
+
+    const errors = updateResponse.data.data?.customerUpdate?.userErrors;
+    if (errors && errors.length > 0) {
+      console.error('❌ Shopify errors:', errors);
+      return res.status(400).json({ success: false, error: errors });
+    }
+
+    res.json({ success: true, wishlist: newWishlist });
+  } catch (err) {
+    console.error('❌ ERROR removing from wishlist:', err.response?.data || err.message);
+    res.status(500).json({ success: false, error: err.response?.data || err.message });
   }
 });
 
