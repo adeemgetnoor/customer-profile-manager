@@ -751,7 +751,7 @@ app.post('/wishlist/add', async (req, res) => {
     const updateVars = {
       input: {
         id: `gid://shopify/Customer/${customer_id}`,
-        metafields: [{ namespace: 'custom', key: 'wishlist', value: JSON.stringify(wishlist), type: 'json' }]
+        metafields: [{ namespace: 'custom', key: 'wishlist', value: JSON.stringify(wishlist), type: 'single_line_text_field' }]
       }
     };
 
@@ -828,7 +828,7 @@ app.post('/wishlist/remove', async (req, res) => {
     const updateVars = {
       input: {
         id: `gid://shopify/Customer/${customer_id}`,
-        metafields: [{ namespace: 'custom', key: 'wishlist', value: JSON.stringify(newWishlist), type: 'json' }]
+        metafields: [{ namespace: 'custom', key: 'wishlist', value: JSON.stringify(newWishlist), type: 'single_line_text_field' }]
       }
     };
 
