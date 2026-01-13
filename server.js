@@ -96,6 +96,56 @@ async function fetchProductById(product_id) {
   }
 }
 
+function gidToId(gid) {
+  if (!gid) return gid;
+  const parts = String(gid).split('/');
+  return parts[parts.length - 1];
+}
+
+// Helper: fetch product by handle via GraphQL
+async function fetchProductByHandle(handle) {
+  try {
+    const query = `
+      query productByHandle($handle: String!) {
+        productByHandle(handle: $handle) {
+          id
+          handle
+          title
+          images(first: 1) {
+            edges {
+              node {
+                url
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const variables = { handle };
+
+    const resp = await axios.post(
+      `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
+      { query, variables },
+      { headers: { 'X-Shopify-Access-Token': ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+    );
+
+    const p = resp.data.data?.productByHandle;
+    if (!p) return null;
+
+    const id = gidToId(p.id);
+    return {
+      id: String(id),
+      handle: p.handle,
+      title: p.title,
+      image: p.images?.edges?.[0]?.node?.url || null
+    };
+  } catch (e) {
+    console.error('❌ Error fetching product by handle:', e.response?.data || e.message);
+    return null;
+  }
+}
+
 // ============================================
 // ROOT ENDPOINT - Welcome Message
 // ============================================
@@ -113,9 +163,10 @@ app.get('/', (req, res) => {
       updateProfile: '/update-profile (POST) - Update customer metafields',
       getProfile: '/get-profile?customer_id=xxx (GET) - Get customer profile',
       uploadImage: '/upload-profile-image (POST) - Upload profile image',
-      getWishlist: '/wishlist?customer_id=xxx (GET) - Get wishlist items',
-      addWishlist: '/wishlist/add (POST) - Add product to wishlist { customer_id, product_id }',
-      removeWishlist: '/wishlist/remove (POST) - Remove product from wishlist { customer_id, product_id }'
+      getWishlist: '/wishlist?customer_id=xxx (GET) - Get wishlist items (normalized objects with id/handle)',
+      addWishlist: '/wishlist/add (POST) - Add product to wishlist { customer_id, product_id|product_handle|product }',
+      removeWishlist: '/wishlist/remove (POST) - Remove product from wishlist { customer_id, product_id|product_handle|product }',
+      attachHandles: '/wishlist/attach-handles (POST) - Attach or set handles for wishlist items { customer_id, mappings: [{ id, handle }] }'
     }
   });
 });
@@ -736,6 +787,58 @@ app.get('/wishlist', async (req, res) => {
       }
     }
 
+    // Backfill handles for items with id but no handle, and persist the enriched wishlist
+    try {
+      let needSave = false;
+      for (let i = 0; i < wishlist.length; i++) {
+        const item = wishlist[i];
+        if (item && item.id && !item.handle) {
+          const fetched = await fetchProductById(item.id);
+          if (fetched && fetched.handle) {
+            wishlist[i] = { ...item, ...fetched };
+            needSave = true;
+          }
+        }
+      }
+
+      if (needSave) {
+        const mutation = `
+          mutation updateCustomerMetafields($input: CustomerInput!) {
+            customerUpdate(input: $input) {
+              customer { id metafields(first: 10, namespace: "custom") { edges { node { key value } } } }
+              userErrors { field message }
+            }
+          }
+        `;
+
+        const updateVars = {
+          input: {
+            id: `gid://shopify/Customer/${customer_id}`,
+            metafields: [{ namespace: 'custom', key: 'wishlist', value: JSON.stringify(wishlist), type: 'single_line_text_field' }]
+          }
+        };
+
+        try {
+          const saveResponse = await axios.post(
+            `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
+            { query: mutation, variables: updateVars },
+            { headers: { 'X-Shopify-Access-Token': ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+          );
+
+          const saveErrors = saveResponse.data.data?.customerUpdate?.userErrors;
+          if (saveErrors && saveErrors.length > 0) {
+            console.error('❌ Shopify errors saving enriched wishlist:', saveErrors);
+          } else {
+            console.log('✅ Wishlist enriched and saved with product handles');
+          }
+        } catch (saveErr) {
+          console.error('❌ Error saving enriched wishlist:', saveErr.response?.data || saveErr.message);
+        }
+      }
+    } catch (e) {
+      console.error('❌ Error during wishlist backfill:', e.message);
+    }
+
     res.json({ success: true, wishlist });
   } catch (err) {
     console.error('❌ ERROR fetching wishlist:', err.message);
@@ -931,6 +1034,134 @@ app.post('/wishlist/remove', async (req, res) => {
     res.json({ success: true, wishlist: newWishlist });
   } catch (err) {
     console.error('❌ ERROR removing from wishlist:', err.response?.data || err.message);
+    res.status(500).json({ success: false, error: err.response?.data || err.message });
+  }
+});
+
+// POST /wishlist/attach-handles - attach handles to existing wishlist items or add items by handle
+app.post('/wishlist/attach-handles', async (req, res) => {
+  try {
+    const { customer_id, mappings } = req.body;
+    if (!customer_id || !mappings) return res.status(400).json({ success: false, error: 'customer_id and mappings are required' });
+
+    const items = Array.isArray(mappings) ? mappings : [mappings];
+
+    // Fetch current wishlist
+    const query = `
+      query getCustomer($id: ID!) {
+        customer(id: $id) {
+          id
+          metafields(first: 10, namespace: "custom") {
+            edges {
+              node {
+                key
+                value
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const variables = { id: `gid://shopify/Customer/${customer_id}` };
+
+    const response = await axios.post(
+      `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
+      { query, variables },
+      { headers: { 'X-Shopify-Access-Token': ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+    );
+
+    const edges = response.data.data?.customer?.metafields?.edges || [];
+    const node = edges.find(e => e.node.key === 'wishlist');
+    let wishlist = [];
+    if (node && node.node.value) {
+      try { wishlist = JSON.parse(node.node.value); if (!Array.isArray(wishlist)) wishlist = []; } catch (e) { wishlist = []; }
+    }
+
+    // Normalize existing entries
+    wishlist = normalizeWishlistEntries(wishlist);
+
+    let changed = false;
+
+    for (const mapping of items) {
+      const mappingId = mapping?.id ? String(mapping.id) : null;
+      const mappingHandle = mapping?.handle ? String(mapping.handle) : null;
+
+      if (!mappingId && !mappingHandle) continue;
+
+      if (mappingHandle) {
+        // Try to fetch product by handle to enrich
+        const fetched = await fetchProductByHandle(mappingHandle);
+
+        // Try to find existing by id first, then by handle
+        let foundIndex = -1;
+        if (mappingId) foundIndex = wishlist.findIndex(w => w && String(w.id) === mappingId);
+        if (foundIndex === -1 && fetched) foundIndex = wishlist.findIndex(w => w && w.handle === fetched.handle);
+
+        if (foundIndex !== -1) {
+          wishlist[foundIndex] = { ...(wishlist[foundIndex] || {}), ...(fetched || { handle: mappingHandle }) };
+          changed = true;
+        } else {
+          // Add new item if not duplicate
+          const exists = wishlist.some(w => (fetched && fetched.handle && w.handle === fetched.handle) || (mappingId && w.id && String(w.id) === mappingId));
+          if (!exists) {
+            wishlist.push(fetched || (mappingId ? { id: mappingId, handle: mappingHandle } : { handle: mappingHandle }));
+            changed = true;
+          }
+        }
+
+      } else if (mappingId) {
+        // Only id provided: try to fetch product to get handle
+        const idx = wishlist.findIndex(w => w && String(w.id) === mappingId);
+        if (idx !== -1) {
+          const fetched = await fetchProductById(mappingId);
+          if (fetched && fetched.handle && fetched.handle !== wishlist[idx].handle) {
+            wishlist[idx] = { ...(wishlist[idx] || {}), ...fetched };
+            changed = true;
+          }
+        }
+      }
+    }
+
+    // Persist changes if any
+    if (changed) {
+      const mutation = `
+        mutation updateCustomerMetafields($input: CustomerInput!) {
+          customerUpdate(input: $input) {
+            customer { id metafields(first: 10, namespace: "custom") { edges { node { key value } } } }
+            userErrors { field message }
+          }
+        }
+      `;
+
+      const updateVars = {
+        input: {
+          id: `gid://shopify/Customer/${customer_id}`,
+          metafields: [{ namespace: 'custom', key: 'wishlist', value: JSON.stringify(wishlist), type: 'single_line_text_field' }]
+        }
+      };
+
+      try {
+        const saveResponse = await axios.post(
+          `https://${SHOP_NAME}/admin/api/${API_VERSION}/graphql.json`,
+          { query: mutation, variables: updateVars },
+          { headers: { 'X-Shopify-Access-Token': ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+        );
+
+        const saveErrors = saveResponse.data.data?.customerUpdate?.userErrors;
+        if (saveErrors && saveErrors.length > 0) {
+          console.error('❌ Shopify errors saving attached handles:', saveErrors);
+        } else {
+          console.log('✅ Attached handles saved to wishlist');
+        }
+      } catch (saveErr) {
+        console.error('❌ Error saving attached handles:', saveErr.response?.data || saveErr.message);
+      }
+    }
+
+    res.json({ success: true, wishlist });
+  } catch (err) {
+    console.error('❌ ERROR attaching handles to wishlist:', err.response?.data || err.message);
     res.status(500).json({ success: false, error: err.response?.data || err.message });
   }
 });
