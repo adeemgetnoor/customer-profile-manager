@@ -64,6 +64,38 @@ app.use((req, res, next) => {
   next();
 });
 
+// Helper: normalize wishlist entries (strings -> objects)
+function normalizeWishlistEntries(list) {
+  return list.map(item => {
+    if (typeof item === 'string' || typeof item === 'number') {
+      return { id: String(item) };
+    } else if (item && typeof item === 'object') {
+      return item;
+    } else {
+      return item;
+    }
+  });
+}
+
+// Helper: fetch basic product data by product_id using REST API
+async function fetchProductById(product_id) {
+  try {
+    const resp = await axios.get(`https://${SHOP_NAME}/admin/api/${API_VERSION}/products/${product_id}.json`, {
+      headers: { 'X-Shopify-Access-Token': ACCESS_TOKEN, 'Content-Type': 'application/json' }
+    });
+    const p = resp.data.product;
+    return {
+      id: String(p.id),
+      handle: p.handle,
+      title: p.title,
+      image: p.image ? p.image.src : null
+    };
+  } catch (e) {
+    console.error('❌ Error fetching product by id:', e.response?.data || e.message);
+    return null;
+  }
+}
+
 // ============================================
 // ROOT ENDPOINT - Welcome Message
 // ============================================
@@ -653,7 +685,7 @@ app.post('/upload-profile-image', async (req, res) => {
 // ENDPOINT: Wishlist - Get / Add / Remove
 // ============================================
 
-// GET wishlist - retrieve wishlist array (stored as JSON in custom.wishlist)
+// GET wishlist - retrieve wishlist array (stored as JSON in custom.wishlist). Returns objects containing at least { id } or { handle }.
 app.get('/wishlist', async (req, res) => {
   try {
     const { customer_id } = req.query;
@@ -690,6 +722,20 @@ app.get('/wishlist', async (req, res) => {
       try { wishlist = JSON.parse(node.node.value); if (!Array.isArray(wishlist)) wishlist = []; } catch (e) { wishlist = []; }
     }
 
+    // Normalize entries (support legacy string ids)
+    wishlist = normalizeWishlistEntries(wishlist);
+
+    // Optional: expand items that only have ids when expand=true
+    if (req.query.expand === 'true') {
+      for (let i = 0; i < wishlist.length; i++) {
+        const item = wishlist[i];
+        if (item && item.id && (!item.title && !item.handle)) {
+          const fetched = await fetchProductById(item.id);
+          if (fetched) wishlist[i] = { ...item, ...fetched };
+        }
+      }
+    }
+
     res.json({ success: true, wishlist });
   } catch (err) {
     console.error('❌ ERROR fetching wishlist:', err.message);
@@ -697,11 +743,11 @@ app.get('/wishlist', async (req, res) => {
   }
 });
 
-// POST /wishlist/add - add a product to wishlist
+// POST /wishlist/add - add a product to wishlist. Accepts product_id, product_handle or full product object (product).
 app.post('/wishlist/add', async (req, res) => {
   try {
-    const { customer_id, product_id } = req.body;
-    if (!customer_id || !product_id) return res.status(400).json({ success: false, error: 'customer_id and product_id required' });
+    const { customer_id, product_id, product_handle, product } = req.body;
+    if (!customer_id || (!product_id && !product_handle && !product)) return res.status(400).json({ success: false, error: 'customer_id and product_id|product_handle|product required' });
 
     // Fetch current wishlist
     const query = `
@@ -735,10 +781,30 @@ app.post('/wishlist/add', async (req, res) => {
       try { wishlist = JSON.parse(node.node.value); if (!Array.isArray(wishlist)) wishlist = []; } catch (e) { wishlist = []; }
     }
 
-    const pid = String(product_id);
-    if (!wishlist.includes(pid)) wishlist.push(pid);
+    // Normalize existing entries
+    wishlist = normalizeWishlistEntries(wishlist);
 
-    // Update metafield
+    // Build new product data
+    let newProduct = null;
+    if (product && typeof product === 'object') {
+      newProduct = product;
+    } else if (product_handle) {
+      newProduct = { handle: String(product_handle) };
+    } else if (product_id) {
+      const fetched = await fetchProductById(product_id);
+      newProduct = fetched || { id: String(product_id) };
+    }
+
+    // Avoid duplicates (prefer handle, then id)
+    const exists = wishlist.some(item => {
+      if (newProduct.handle && item.handle) return item.handle === newProduct.handle;
+      if (newProduct.id && item.id) return String(item.id) === String(newProduct.id);
+      return false;
+    });
+
+    if (!exists) wishlist.push(newProduct);
+
+    // Update metafield (store objects)
     const mutation = `
       mutation updateCustomerMetafields($input: CustomerInput!) {
         customerUpdate(input: $input) {
@@ -774,11 +840,11 @@ app.post('/wishlist/add', async (req, res) => {
   }
 });
 
-// POST /wishlist/remove - remove a product from wishlist
+// POST /wishlist/remove - remove a product from wishlist. Accepts product_id, product_handle or full product object (product).
 app.post('/wishlist/remove', async (req, res) => {
   try {
-    const { customer_id, product_id } = req.body;
-    if (!customer_id || !product_id) return res.status(400).json({ success: false, error: 'customer_id and product_id required' });
+    const { customer_id, product_id, product_handle, product } = req.body;
+    if (!customer_id || (!product_id && !product_handle && !product)) return res.status(400).json({ success: false, error: 'customer_id and product_id|product_handle|product required' });
 
     // Fetch current wishlist
     const query = `
@@ -812,8 +878,26 @@ app.post('/wishlist/remove', async (req, res) => {
       try { wishlist = JSON.parse(node.node.value); if (!Array.isArray(wishlist)) wishlist = []; } catch (e) { wishlist = []; }
     }
 
-    const pid = String(product_id);
-    const newWishlist = wishlist.filter(p => String(p) !== pid);
+    // Normalize existing entries
+    wishlist = normalizeWishlistEntries(wishlist);
+
+    // Determine removal key
+    let handleToRemove = null;
+    let idToRemove = null;
+
+    if (product && typeof product === 'object') {
+      if (product.handle) handleToRemove = String(product.handle);
+      if (product.id) idToRemove = String(product.id);
+    }
+    if (product_handle) handleToRemove = String(product_handle);
+    if (product_id) idToRemove = String(product_id);
+
+    const newWishlist = wishlist.filter(item => {
+      if (handleToRemove && item.handle) return item.handle !== handleToRemove;
+      if (idToRemove && item.id) return String(item.id) !== idToRemove;
+      // If wishlist items are objects that don't match the removal keys, keep them
+      return true;
+    });
 
     // Update metafield
     const mutation = `
